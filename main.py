@@ -963,114 +963,1228 @@ async def apply_bot_settings():
 
 @app.route("/bot/stop", methods=["POST"])
 def stop_bot():
+import os
+import json
+import secrets
+import asyncio
+import urllib.parse
+import urllib.request
+import urllib.error
+import threading
 
-    global bot_running
+import discord
+from discord.ext import commands
+from flask import Flask, redirect, request, session, render_template_string
 
-    if not bot_loop:
-        return redirect("/bot-settings")
 
-    async def close_bot():
-        global bot_running
-        bot_running = False
-        await bot.close()
+# =========================
+# Environment
+# =========================
 
-    asyncio.run_coroutine_threadsafe(
-        close_bot(),
-        bot_loop
+TOKEN = os.environ["DISCORD_TOKEN"].strip()
+CLIENT_ID = os.environ["DISCORD_CLIENT_ID"].strip()
+CLIENT_SECRET = os.environ["DISCORD_CLIENT_SECRET"].strip()
+
+REDIRECT_URI = os.environ.get(
+    "DISCORD_REDIRECT_URI",
+    "https://supportbot-production-c479.up.railway.app/callback",
+).strip()
+
+
+# =========================
+# Settings
+# =========================
+
+SUPPORT_SERVER = "https://discord.gg/4uKAWftJv"
+SETTINGS_FILE = "bot_settings.json"
+
+
+# =========================
+# Discord Bot
+# =========================
+
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
+)
+
+
+# =========================
+# Flask
+# =========================
+
+app = Flask(__name__)
+app.secret_key = CLIENT_SECRET
+
+
+# =========================
+# Load settings
+# =========================
+
+try:
+    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+
+except (FileNotFoundError, json.JSONDecodeError):
+    settings = {
+        "name": "SupportBot",
+        "description": "A simple and powerful support bot for everyone.",
+        "activity_type": "Watching",
+        "activity_text": "Over server security",
+        "status": "online",
+    }
+
+
+def save_settings():
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            settings,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+# =========================
+# Bot activity
+# =========================
+
+def make_activity():
+
+    text = settings.get(
+        "activity_text",
+        ""
+    ).strip()
+
+    if not text:
+        return None
+
+    activity_type = settings.get(
+        "activity_type",
+        "Watching"
     )
 
-    return redirect("/bot-settings")
+    if activity_type == "Playing":
+        return discord.Game(
+            name=text
+        )
+
+    if activity_type == "Listening":
+        return discord.Activity(
+            type=discord.ActivityType.listening,
+            name=text
+        )
+
+    if activity_type == "Streaming":
+        return discord.Streaming(
+            name=text,
+            url="https://www.twitch.tv/discord"
+        )
+
+    return discord.Activity(
+        type=discord.ActivityType.watching,
+        name=text
+    )
 
 
-# =========================================================
-# START BOT
-# =========================================================
+def make_status():
 
-@app.route("/bot/start", methods=["POST"])
-def start_bot():
+    value = settings.get(
+        "status",
+        "online"
+    ).lower()
 
-    global bot_start_task
-    global bot_running
+    if value == "idle":
+        return discord.Status.idle
 
-    if not bot_loop:
-        return redirect("/bot-settings")
+    if value == "dnd":
+        return discord.Status.dnd
 
-    if bot_running:
-        return redirect("/bot-settings")
+    if value == "invisible":
+        return discord.Status.invisible
 
-    async def start_bot_connection():
+    return discord.Status.online
 
-        global bot_running
 
-        try:
-            bot_running = True
+async def apply_bot_settings():
 
-            await bot.start(
-                TOKEN,
-                reconnect=True
+    if not bot.is_ready():
+        return
+
+    try:
+
+        await bot.change_presence(
+            status=make_status(),
+            activity=make_activity()
+        )
+
+        new_name = settings.get(
+            "name",
+            "SupportBot"
+        ).strip()
+
+        if (
+            new_name
+            and bot.user
+            and bot.user.name != new_name
+        ):
+            try:
+                await bot.user.edit(
+                    username=new_name
+                )
+            except discord.HTTPException:
+                pass
+
+    except Exception as e:
+        print(
+            "Settings apply error:",
+            repr(e)
+        )
+
+
+# =========================
+# Bot events
+# =========================
+
+@bot.event
+async def on_ready():
+
+    print(
+        f"Logged in as {bot.user} "
+        f"({bot.user.id})"
+    )
+
+    await apply_bot_settings()
+
+
+# =========================
+# Test command
+# =========================
+
+@bot.command()
+async def ping(ctx):
+
+    await ctx.send(
+        f"Pong! `{round(bot.latency * 1000)}ms`"
+    )
+
+
+# =========================
+# Discord OAuth helper
+# =========================
+
+def discord_json_request(
+    url,
+    data=None,
+    headers=None
+):
+
+    request_obj = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers or {},
+        method="POST" if data is not None else "GET"
+    )
+
+    with urllib.request.urlopen(
+        request_obj,
+        timeout=15
+    ) as response:
+
+        raw = response.read().decode(
+            "utf-8"
+        )
+
+        return json.loads(raw)
+
+
+# =========================
+# HOME
+# =========================
+
+@app.route("/")
+def home():
+
+    return render_template_string(
+        """
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8">
+
+<title>SupportBot</title>
+
+<style>
+
+body {
+    margin: 0;
+    background: #111827;
+    color: white;
+    font-family: Arial, sans-serif;
+}
+
+.wrap {
+    max-width: 900px;
+    margin: 80px auto;
+    padding: 30px;
+}
+
+.card {
+    background: #1f2937;
+    border-radius: 18px;
+    padding: 30px;
+}
+
+a {
+    display: inline-block;
+    padding: 12px 18px;
+    border-radius: 10px;
+    text-decoration: none;
+    background: #5865F2;
+    color: white;
+    margin-right: 8px;
+}
+
+.secondary {
+    background: #374151;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="wrap">
+
+<div class="card">
+
+<h1>🎫 SupportBot</h1>
+
+<p>
+A simple and powerful support bot for everyone.
+</p>
+
+<a href="/login">
+Dashboard
+</a>
+
+<a href="/invite">
+Invite SupportBot
+</a>
+
+<a
+class="secondary"
+href="{{ support }}"
+>
+Support Server
+</a>
+
+</div>
+
+</div>
+
+</body>
+
+</html>
+        """,
+        support=SUPPORT_SERVER
+    )
+
+
+# =========================
+# INVITE BOT
+# =========================
+
+@app.route("/invite")
+def invite():
+
+    params = {
+        "client_id": CLIENT_ID,
+        "permissions": "8",
+        "scope": "bot applications.commands"
+    }
+
+    return redirect(
+        "https://discord.com/oauth2/authorize?"
+        + urllib.parse.urlencode(params)
+    )
+
+
+# =========================
+# LOGIN
+# =========================
+
+@app.route("/login")
+def login():
+
+    state = secrets.token_urlsafe(32)
+
+    session["oauth_state"] = state
+
+    params = {
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "scope": "identify guilds",
+        "state": state
+    }
+
+    return redirect(
+        "https://discord.com/oauth2/authorize?"
+        + urllib.parse.urlencode(params)
+    )
+
+
+# =========================
+# CALLBACK
+# =========================
+
+@app.route("/callback")
+def callback():
+
+    error = request.args.get(
+        "error"
+    )
+
+    if error:
+
+        return (
+            f"Discord OAuth error: "
+            f"{error}"
+        ), 400
+
+    code = request.args.get(
+        "code"
+    )
+
+    state = request.args.get(
+        "state"
+    )
+
+    if not code:
+
+        return (
+            "Missing OAuth code."
+        ), 400
+
+    saved_state = session.pop(
+        "oauth_state",
+        None
+    )
+
+    if (
+        not saved_state
+        or state != saved_state
+    ):
+
+        return (
+            "Invalid OAuth state. "
+            "Please start login again."
+        ), 400
+
+    # =========================
+    # Token request
+    # =========================
+
+    token_data = urllib.parse.urlencode({
+
+        "client_id": CLIENT_ID,
+
+        "client_secret": CLIENT_SECRET,
+
+        "grant_type":
+            "authorization_code",
+
+        "code": code,
+
+        "redirect_uri":
+            REDIRECT_URI
+
+    }).encode("utf-8")
+
+    try:
+
+        token_json = discord_json_request(
+
+            "https://discord.com/api/oauth2/token",
+
+            data=token_data,
+
+            headers={
+
+                "Content-Type":
+                    "application/x-www-form-urlencoded",
+
+                "Accept":
+                    "application/json",
+
+                "User-Agent":
+                    "SupportBot-Dashboard/1.0"
+            }
+        )
+
+    except urllib.error.HTTPError as e:
+
+        body = e.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+
+        print(
+            f"Discord OAuth token HTTP "
+            f"{e.code}: {body}"
+        )
+
+        safe_body = (
+            body
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+        return (
+            f"""
+            <h2>
+            OAuth token error: HTTP {e.code}
+            </h2>
+
+            <p>
+            Discord response:
+            </p>
+
+            <pre>
+            {safe_body}
+            </pre>
+            """
+        ), e.code
+
+    except Exception as e:
+
+        print(
+            "Discord OAuth token error:",
+            repr(e)
+        )
+
+        return (
+            f"OAuth token error: {e}"
+        ), 500
+
+    # =========================
+    # Access token
+    # =========================
+
+    access_token = token_json.get(
+        "access_token"
+    )
+
+    if not access_token:
+
+        return (
+            "Discord did not return "
+            f"an access token: {token_json}"
+        ), 500
+
+    session["access_token"] = (
+        access_token
+    )
+
+    return redirect(
+        "/dashboard"
+    )
+
+
+# =========================
+# Discord GET
+# =========================
+
+def discord_get(
+    path,
+    access_token
+):
+
+    req = urllib.request.Request(
+
+        "https://discord.com/api" + path,
+
+        headers={
+
+            "Authorization":
+                f"Bearer {access_token}",
+
+            "Accept":
+                "application/json",
+
+            "User-Agent":
+                "SupportBot-Dashboard/1.0"
+        }
+    )
+
+    with urllib.request.urlopen(
+        req,
+        timeout=15
+    ) as response:
+
+        return json.loads(
+            response.read().decode(
+                "utf-8"
+            )
+        )
+
+
+# =========================
+# DASHBOARD
+# =========================
+
+@app.route("/dashboard")
+def dashboard():
+
+    access_token = session.get(
+        "access_token"
+    )
+
+    if not access_token:
+
+        return redirect(
+            "/login"
+        )
+
+    try:
+
+        user = discord_get(
+            "/users/@me",
+            access_token
+        )
+
+        guilds = discord_get(
+            "/users/@me/guilds",
+            access_token
+        )
+
+    except urllib.error.HTTPError:
+
+        session.pop(
+            "access_token",
+            None
+        )
+
+        return redirect(
+            "/login"
+        )
+
+    except Exception as e:
+
+        return (
+            f"Dashboard error: {e}"
+        ), 500
+
+    manageable = []
+
+    for guild in guilds:
+
+        permissions = int(
+            guild.get(
+                "permissions",
+                "0"
+            )
+        )
+
+        if (
+            permissions & 0x8
+            or permissions & 0x20
+        ):
+
+            manageable.append(
+                guild
             )
 
-        except Exception as e:
-            bot_running = False
-            print("Bot start error:", e)
+    return render_template_string(
+        """
+<!doctype html>
 
-    bot_start_task = asyncio.run_coroutine_threadsafe(
-        start_bot_connection(),
-        bot_loop
+<html>
+
+<head>
+
+<meta charset="utf-8">
+
+<title>Dashboard</title>
+
+<style>
+
+body {
+    margin: 0;
+    background: #111827;
+    color: white;
+    font-family: Arial, sans-serif;
+}
+
+.wrap {
+    max-width: 900px;
+    margin: 50px auto;
+    padding: 20px;
+}
+
+.card {
+    background: #1f2937;
+    padding: 22px;
+    border-radius: 16px;
+    margin: 12px 0;
+}
+
+.server {
+    background: #374151;
+    padding: 15px;
+    border-radius: 10px;
+    margin: 8px 0;
+}
+
+.server a {
+    color: white;
+    text-decoration: none;
+}
+
+.logout {
+    display: inline-block;
+    background: #ef4444;
+    padding: 10px 15px;
+    border-radius: 9px;
+    color: white;
+    text-decoration: none;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="wrap">
+
+<div class="card">
+
+<h1>Dashboard</h1>
+
+<p>
+Welcome,
+{{ user.get("username", "User") }}!
+</p>
+
+<a
+class="logout"
+href="/logout"
+>
+Logout
+</a>
+
+</div>
+
+<div class="card">
+
+<h2>Your Servers</h2>
+
+{% if guilds %}
+
+{% for guild in guilds %}
+
+<div class="server">
+
+<a
+href="/server/{{ guild["id"] }}"
+>
+{{ guild["name"] }}
+</a>
+
+</div>
+
+{% endfor %}
+
+{% else %}
+
+<p>
+No manageable servers found.
+</p>
+
+{% endif %}
+
+</div>
+
+</div>
+
+</body>
+
+</html>
+        """,
+        user=user,
+        guilds=manageable
     )
 
-    return redirect("/bot-settings")
+
+# =========================
+# SERVER PAGE
+# =========================
+
+@app.route(
+    "/server/<server_id>"
+)
+def server_page(server_id):
+
+    if not session.get(
+        "access_token"
+    ):
+
+        return redirect(
+            "/login"
+        )
+
+    return render_template_string(
+        """
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8">
+
+<title>Server</title>
+
+<style>
+
+body {
+    margin: 0;
+    background: #111827;
+    color: white;
+    font-family: Arial, sans-serif;
+}
+
+.wrap {
+    max-width: 800px;
+    margin: 60px auto;
+    padding: 20px;
+}
+
+.card {
+    background: #1f2937;
+    border-radius: 18px;
+    padding: 30px;
+}
+
+a {
+    display: inline-block;
+    background: #5865F2;
+    color: white;
+    padding: 12px 18px;
+    border-radius: 10px;
+    text-decoration: none;
+    margin: 5px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="wrap">
+
+<div class="card">
+
+<h1>Server Settings</h1>
+
+<p>
+Server ID: {{ server_id }}
+</p>
+
+<a href="/bot-settings">
+Bot Settings
+</a>
+
+<a href="/dashboard">
+Back
+</a>
+
+</div>
+
+</div>
+
+</body>
+
+</html>
+        """,
+        server_id=server_id
+    )
 
 
-# =========================================================
+# =========================
+# BOT SETTINGS
+# =========================
+
+@app.route(
+    "/bot-settings",
+    methods=["GET", "POST"]
+)
+def bot_settings():
+
+    if not session.get(
+        "access_token"
+    ):
+
+        return redirect(
+            "/login"
+        )
+
+    if request.method == "POST":
+
+        settings["name"] = (
+            request.form.get(
+                "name",
+                "SupportBot"
+            ).strip()
+            or "SupportBot"
+        )
+
+        settings["description"] = (
+            request.form.get(
+                "description",
+                ""
+            ).strip()
+        )
+
+        settings["activity_type"] = (
+            request.form.get(
+                "activity_type",
+                "Watching"
+            )
+        )
+
+        settings["activity_text"] = (
+            request.form.get(
+                "activity_text",
+                ""
+            ).strip()
+        )
+
+        settings["status"] = (
+            request.form.get(
+                "status",
+                "online"
+            )
+        )
+
+        save_settings()
+
+        if bot.is_ready():
+
+            asyncio.run_coroutine_threadsafe(
+
+                apply_bot_settings(),
+
+                bot.loop
+            )
+
+        return redirect(
+            "/bot-settings?saved=1"
+        )
+
+    class SettingsView:
+        pass
+
+    s = SettingsView()
+
+    for key, value in settings.items():
+        setattr(s, key, value)
+
+    return render_template_string(
+        """
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8">
+
+<title>Bot Settings</title>
+
+<style>
+
+body {
+    margin: 0;
+    background: #111827;
+    color: white;
+    font-family: Arial, sans-serif;
+}
+
+.wrap {
+    max-width: 800px;
+    margin: 40px auto;
+    padding: 20px;
+}
+
+.card {
+    background: #1f2937;
+    border-radius: 18px;
+    padding: 28px;
+}
+
+label {
+    display: block;
+    margin-top: 16px;
+    margin-bottom: 7px;
+}
+
+input,
+textarea,
+select {
+
+    width: 100%;
+
+    box-sizing: border-box;
+
+    padding: 12px;
+
+    border-radius: 9px;
+
+    border: 1px solid #4b5563;
+
+    background: #111827;
+
+    color: white;
+}
+
+textarea {
+    min-height: 100px;
+}
+
+button {
+
+    margin-top: 20px;
+
+    padding: 12px 18px;
+
+    border: 0;
+
+    border-radius: 9px;
+
+    background: #5865F2;
+
+    color: white;
+
+    cursor: pointer;
+}
+
+a {
+    color: white;
+}
+
+.success {
+
+    background: #065f46;
+
+    padding: 10px;
+
+    border-radius: 9px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="wrap">
+
+<div class="card">
+
+<h1>Bot Settings</h1>
+
+{% if request.args.get("saved") %}
+
+<div class="success">
+Settings saved.
+</div>
+
+{% endif %}
+
+<form method="post">
+
+<label>
+Bot Name
+</label>
+
+<input
+name="name"
+value="{{ s.name }}"
+>
+
+<label>
+Description
+</label>
+
+<textarea
+name="description"
+>{{ s.description }}</textarea>
+
+<label>
+Activity Type
+</label>
+
+<select name="activity_type">
+
+{% for x in [
+"Playing",
+"Watching",
+"Listening",
+"Streaming"
+] %}
+
+<option
+{% if s.activity_type == x %}
+selected
+{% endif %}
+>
+{{ x }}
+</option>
+
+{% endfor %}
+
+</select>
+
+<label>
+Activity Text
+</label>
+
+<input
+name="activity_text"
+value="{{ s.activity_text }}"
+>
+
+<label>
+Status
+</label>
+
+<select name="status">
+
+<option
+value="online"
+{% if s.status == "online" %}
+selected
+{% endif %}
+>
+Online
+</option>
+
+<option
+value="idle"
+{% if s.status == "idle" %}
+selected
+{% endif %}
+>
+Idle
+</option>
+
+<option
+value="dnd"
+{% if s.status == "dnd" %}
+selected
+{% endif %}
+>
+Do Not Disturb
+</option>
+
+<option
+value="invisible"
+{% if s.status == "invisible" %}
+selected
+{% endif %}
+>
+Invisible
+</option>
+
+</select>
+
+<button type="submit">
+Save Settings
+</button>
+
+</form>
+
+<p>
+<a href="/dashboard">
+← Back to Dashboard
+</a>
+</p>
+
+</div>
+
+</div>
+
+</body>
+
+</html>
+        """,
+        s=s
+    )
+
+
+# =========================
 # LOGOUT
-# =========================================================
+# =========================
 
 @app.route("/logout")
 def logout():
 
     session.clear()
+
     return redirect("/")
 
 
-# =========================================================
+# =========================
 # HEALTH
-# =========================================================
+# =========================
 
 @app.route("/health")
 def health():
 
-    return {
-        "status": "ok",
-        "bot_running": bot_running
-    }
+    return "SupportBot is online!"
 
 
-# =========================================================
-# FLASK THREAD
-# =========================================================
+# =========================
+# Flask thread
+# =========================
 
 def run_flask():
 
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
     app.run(
         host="0.0.0.0",
-        port=PORT,
-        debug=False,
+        port=port,
         use_reloader=False
     )
 
 
-# =========================================================
+# =========================
 # START
-# =========================================================
+# =========================
 
 if __name__ == "__main__":
 
-    flask_thread = threading.Thread(
+    threading.Thread(
         target=run_flask,
         daemon=True
-    )
-
-    flask_thread.start()
+    ).start()
 
     bot.run(TOKEN)
