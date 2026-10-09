@@ -209,7 +209,7 @@ label{color:#d9dce3;font-weight:600}.server{background:#0e1117;border-radius:12p
 </style>
 """
 
-def page(title, body, **ctx):
+def page(page_title, body, **ctx):
     template = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title }}</title>""" + STYLE + """
     </head><body><div class="nav"><div class="logo">SupportBot</div>
@@ -217,7 +217,7 @@ def page(title, body, **ctx):
     {% if logged_in %}<a href="/logout">Logout</a>{% endif %}</div></div>
     <div class="container">""" + body + """</div></body></html>"""
     ctx.setdefault("logged_in", "user" in session)
-    return render_template_string(template, title=title, **ctx)
+    return render_template_string(template, title=page_title, **ctx)
 
 def discord_api(endpoint, access_token):
     req = urllib.request.Request("https://discord.com/api" + endpoint, headers={
