@@ -217,7 +217,9 @@ def page(page_title, body, **ctx):
     {% if logged_in %}<a href="/logout">Logout</a>{% endif %}</div></div>
     <div class="container">""" + body + """</div></body></html>"""
     ctx.setdefault("logged_in", "user" in session)
-    return render_template_string(template, title=page_title, **ctx)
+    # Some section routes also pass title=section_title; avoid duplicate keyword args.
+    ctx.setdefault("title", page_title)
+    return render_template_string(template, **ctx)
 
 def discord_api(endpoint, access_token):
     req = urllib.request.Request("https://discord.com/api" + endpoint, headers={
