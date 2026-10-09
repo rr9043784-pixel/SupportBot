@@ -94,7 +94,7 @@ bot_running = False
 bot_lock = threading.RLock()
 
 def create_bot():
-    instance = commands.Bot(command_prefix="!", intents=intents)
+    instance = commands.Bot(command_prefix=lambda _bot, _message: [], intents=intents)
 
     @instance.event
     async def on_ready():
@@ -102,6 +102,8 @@ def create_bot():
         bot_running = True
         print(f"Logged in as {instance.user} ({instance.user.id})")
         try:
+            instance.add_view(TicketCreateView())
+            instance.add_view(TicketCloseView())
             await apply_bot_settings(instance)
             await instance.tree.sync()
         except Exception as exc:
@@ -354,51 +356,317 @@ def add_bot(server_id):
               "guild_id": str(server_id), "disable_guild_select": "true"}
     return redirect("https://discord.com/oauth2/authorize?" + urllib.parse.urlencode(params))
 
-@app.route("/server/<server_id>", methods=["GET", "POST"])
-def server_page(server_id):
+def get_authorized_server(server_id):
     if not logged_in():
-        return redirect("/login")
+        return None, redirect("/login")
     try:
         guilds = get_manageable_guilds()
         guild = next((g for g in guilds if str(g["id"]) == str(server_id)), None)
-    except Exception:
-        session.clear()
-        return redirect("/login")
+    except Exception as exc:
+        print("Guild permission check failed:", repr(exc))
+        return None, redirect("/login")
     if guild is None:
-        return "You do not have permission to manage this server.", 403
-    data = get_server_settings(int(server_id))
-    message = None
-    if request.method == "POST":
-        action = request.form.get("action")
-        if action == "language":
-            value = request.form.get("language", "en")
-            if value not in SUPPORTED_LANGUAGES:
-                message = "Unsupported language."
+        return None, ("You do not have permission to manage this server.", 403)
+    return guild, None
+
+
+def ticket_panel_embed(data):
+    title = str(data.get("panel_title") or "Support Ticket")[:256]
+    description = str(data.get("panel_description") or "Press the button below to create a private support ticket.")[:4000]
+    try:
+        color = int(str(data.get("panel_color", "5865F2")).replace("#", ""), 16)
+    except ValueError:
+        color = 0x5865F2
+    embed = discord.Embed(title=title, description=description, color=color)
+    footer = str(data.get("panel_footer", "SupportBot"))[:2048]
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
+
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="supportbot:ticket:close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This button only works in a server ticket.", ephemeral=True)
+            return
+        cfg = get_server_settings(interaction.guild.id)
+        support_role_id = cfg.get("tickets", {}).get("support_role_id")
+        allowed = interaction.user.guild_permissions.manage_channels or interaction.user.guild_permissions.administrator
+        if support_role_id:
+            role = interaction.guild.get_role(int(support_role_id))
+            if role and role in interaction.user.roles:
+                allowed = True
+        if interaction.channel and interaction.channel.topic and f"ticket_owner={interaction.user.id}" in interaction.channel.topic:
+            allowed = True
+        if not allowed:
+            await interaction.response.send_message("Only the ticket creator or support staff can close this ticket.", ephemeral=True)
+            return
+        await interaction.response.send_message("Closing ticket…", ephemeral=True)
+        channel = interaction.channel
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.delete(reason=f"Ticket closed by {interaction.user} ({interaction.user.id})")
+            except discord.HTTPException as exc:
+                print("Ticket close failed:", repr(exc))
+
+
+class TicketCreateView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Create Ticket", style=discord.ButtonStyle.primary, custom_id="supportbot:ticket:create")
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Please use this button in a server.", ephemeral=True)
+            return
+        cfg = get_server_settings(guild.id)
+        tickets = cfg.get("tickets", {})
+        if not tickets.get("enabled", True):
+            await interaction.response.send_message("Tickets are currently disabled on this server.", ephemeral=True)
+            return
+        category_id = tickets.get("category_id")
+        category = guild.get_channel(int(category_id)) if category_id else None
+        if category_id and not isinstance(category, discord.CategoryChannel):
+            category = None
+        support_role_id = tickets.get("support_role_id")
+        support_role = guild.get_role(int(support_role_id)) if support_role_id else None
+        existing = next((c for c in guild.text_channels if c.topic and f"ticket_owner={interaction.user.id}" in c.topic), None)
+        if existing:
+            await interaction.response.send_message(f"You already have an open ticket: {existing.mention}", ephemeral=True)
+            return
+        base = str(tickets.get("channel_name", "ticket-{username}")).lower()
+        channel_name = base.replace("{username}", interaction.user.name).replace("{user}", interaction.user.name)
+        channel_name = "-".join(part for part in channel_name.replace("_", "-").split("-") if part)[:90] or f"ticket-{interaction.user.id}"
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+        }
+        if guild.me:
+            overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, embed_links=True)
+        if support_role:
+            overwrites[support_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
+        try:
+            channel = await guild.create_text_channel(
+                channel_name, category=category, overwrites=overwrites,
+                topic=f"SupportBot ticket_owner={interaction.user.id}; created_by={interaction.user.id}",
+                reason=f"Support ticket created by {interaction.user} ({interaction.user.id})",
+            )
+            await interaction.response.send_message(f"Your ticket is ready: {channel.mention}", ephemeral=True)
+            msg_text = str(tickets.get("welcome_message", "Hello {user_mention}! Please describe your issue and our team will help you.")).replace("{user_mention}", interaction.user.mention).replace("{user_name}", interaction.user.name).replace("{server_name}", guild.name)
+            if tickets.get("welcome_embed", True):
+                embed = discord.Embed(title=str(tickets.get("welcome_title", "Support Ticket"))[:256], description=msg_text[:4000], color=0x5865F2)
+                await channel.send(content=support_role.mention if support_role else None, embed=embed, view=TicketCloseView(), allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False))
             else:
-                data["language"] = value
-                save_server_settings(int(server_id), data)
-                message = "Language saved."
-        elif action == "reset":
-            reset_server_settings(int(server_id))
-            data = get_server_settings(int(server_id))
-            message = "Server settings reset."
+                await channel.send((f"{support_role.mention} " if support_role else "") + msg_text, view=TicketCloseView(), allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False))
+        except discord.HTTPException as exc:
+            print("Ticket creation failed:", repr(exc))
+            if not interaction.response.is_done():
+                await interaction.response.send_message("I couldn't create the ticket. Check my channel permissions.", ephemeral=True)
+
+
+@app.route("/server/<server_id>")
+def server_page(server_id):
+    guild, error_response = get_authorized_server(server_id)
+    if error_response:
+        return error_response
     installed = bool(bot and bot.get_guild(int(server_id)))
+    data = get_server_settings(int(server_id))
     return page("Server Settings", """
-    <div class="card"><h1>{{ name }}</h1><p>Server ID: {{ server_id }}</p>
-    <p>{{ '🟢 Bot installed' if installed else '⚪ Bot not installed' }}</p>
-    {% if message %}<div class="notice">{{ message }}</div>{% endif %}
-    <form method="post"><input type="hidden" name="action" value="language"><label>Server language</label>
-    <select name="language">{% for code, label in languages.items() %}
-    <option value="{{ code }}" {% if data.get('language','en') == code %}selected{% endif %}>{{ label }}</option>
-    {% endfor %}</select><button>Save Language</button></form>
-    <form method="post" onsubmit="return confirm('Reset server settings?')"><input type="hidden" name="action" value="reset">
-    <button class="red">Reset Server Settings</button></form><a class="button gray" href="/dashboard">Back</a></div>
-    <div class="card"><h2>Bot commands</h2><p><code>!ticketpanel</code>, <code>!ticketcategory ID</code>, <code>!ticketsupportrole @Role</code></p>
-    <p><code>!automod on</code>, <code>!automodlinks on</code>, <code>!automodinvites on</code>, <code>!automodspam on</code></p>
-    <p><code>!welcome on</code>, <code>!welcomechannel #channel</code>, <code>!logs on</code>, <code>!logschannel #channel</code>, <code>!variable list</code></p>
-    <p>Slash command: <code>/language</code></p></div>
-    """, name=guild.get("name", "Discord Server"), server_id=server_id, installed=installed,
-       data=data, message=message, languages=SUPPORTED_LANGUAGES)
+    <div class="card"><a class="button gray" href="/dashboard">← Servers</a><h1>{{ name }}</h1><p>{{ '🟢 Bot installed' if installed else '⚪ Bot not installed' }}</p><p>Every setting below is saved for this server only.</p></div>
+    <div class="grid">
+    {% for key,title,desc in [('tickets','Tickets','Ticket panel, channel names, categories, roles and embeds'),('automod','AutoMod','Links, invites, spam and moderation settings'),('welcome','Welcome','Join messages and welcome channel'),('logs','Logs','Server event logs and log formatting'),('messages','Messages & Variables','Custom message templates and variables'),('language','Language','Choose this server’s language') ] %}
+      <div class="card"><h2>{{ title }}</h2><p>{{ desc }}</p><a class="button" href="/server/{{ server_id }}/{{ key }}">Open {{ title }}</a></div>
+    {% endfor %}
+    </div>
+    <div class="card"><form method="post" action="/server/{{ server_id }}/reset"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="red" onclick="return confirm('Reset all settings for this server?')">Reset Server Settings</button></form></div>
+    """, name=guild.get("name", "Discord Server"), server_id=server_id, installed=installed, csrf=csrf_token())
+
+
+SECTION_TEMPLATES = {
+    "tickets": ("Tickets", [
+        ("enabled", "Enable tickets", "checkbox"), ("category_id", "Ticket category ID", "text"),
+        ("support_role_id", "Support role ID", "text"), ("channel_name", "New ticket channel name template", "text"),
+        ("panel_channel_id", "Panel channel ID", "text"), ("panel_title", "Panel embed title", "text"),
+        ("panel_description", "Panel embed description", "textarea"), ("panel_footer", "Panel footer", "text"),
+        ("panel_color", "Panel color (hex, e.g. 5865F2)", "text"), ("button_label", "Create button label", "text"),
+        ("welcome_title", "Ticket welcome embed title", "text"), ("welcome_message", "Message inside new ticket", "textarea"),
+        ("welcome_embed", "Use an Embed for ticket welcome message", "checkbox"),
+    ]),
+    "automod": ("AutoMod", [
+        ("enabled", "Enable AutoMod", "checkbox"), ("block_links", "Block links", "checkbox"),
+        ("block_invites", "Block Discord invites", "checkbox"), ("block_spam", "Block spam/repeated messages", "checkbox"),
+        ("block_profanity", "Block profanity and common obfuscations", "checkbox"),
+        ("max_repeated_messages", "Repeated message limit", "number"), ("spam_window_seconds", "Spam time window (seconds)", "number"),
+        ("penalty", "Penalty (delete / warn / timeout)", "text"), ("allowed_domains", "Allowed domains (one per line)", "textarea"),
+        ("exempt_role_ids", "Exempt role IDs (one per line)", "textarea"),
+    ]),
+    "welcome": ("Welcome", [("enabled", "Enable welcome messages", "checkbox"), ("channel_id", "Welcome channel ID", "text"), ("message_type", "Message type (embed / normal)", "text"), ("message", "Welcome message", "textarea")]),
+    "logs": ("Logs", [("enabled", "Enable logs", "checkbox"), ("channel_id", "Log channel ID", "text"), ("message_type", "Message type (embed / normal)", "text"), ("message", "Log message template", "textarea")]),
+    "messages": ("Messages & Variables", [("custom_variables", "Custom variables (one name=value per line)", "textarea")]),
+    "language": ("Language", [("language", "Language code (en, ru, tr, es, de, fr)", "text")]),
+}
+
+
+def get_section_data(server_id, section):
+    all_data = get_server_settings(int(server_id))
+    if section in {"tickets", "automod", "welcome", "logs", "messages"}:
+        return all_data.setdefault(section, {})
+    return all_data
+
+
+def form_value_to_storage(section, key, value, field_type):
+    if field_type == "checkbox":
+        return value == "on"
+    if field_type == "number":
+        try:
+            return max(1, min(120, int(value or 1)))
+        except ValueError:
+            return 1
+    if key in {"category_id", "support_role_id", "panel_channel_id", "channel_id"}:
+        value = (value or "").strip()
+        return int(value) if value.isdigit() else None
+    if key in {"allowed_domains", "exempt_role_ids"}:
+        lines = [x.strip() for x in (value or "").splitlines() if x.strip()]
+        if key == "exempt_role_ids":
+            return [int(x) for x in lines if x.isdigit()]
+        return [x.lower().removeprefix("https://").removeprefix("http://").split("/")[0] for x in lines]
+    if key == "custom_variables":
+        result = {}
+        for line in (value or "").splitlines():
+            if "=" in line:
+                name, val = line.split("=", 1)
+                name = name.strip()
+                if name and name.replace("_", "a").isalnum() and len(name) <= 40:
+                    result[name] = val.strip()[:1000]
+        return result
+    return (value or "").strip()[:4000]
+
+
+def storage_value_to_form(section, key, value, field_type):
+    if field_type == "checkbox":
+        return bool(value)
+    if key in {"allowed_domains", "exempt_role_ids"}:
+        return "\n".join(str(x) for x in (value or []))
+    if key == "custom_variables":
+        return "\n".join(f"{k}={v}" for k, v in (value or {}).items())
+    return "" if value is None else str(value)
+
+
+@app.route("/server/<server_id>/<section>", methods=["GET", "POST"])
+def server_section(server_id, section):
+    guild, error_response = get_authorized_server(server_id)
+    if error_response:
+        return error_response
+    if section not in SECTION_TEMPLATES:
+        return "Unknown settings section.", 404
+    section_title, fields = SECTION_TEMPLATES[section]
+    all_data = get_server_settings(int(server_id))
+    data = all_data.setdefault(section, {}) if section in {"tickets", "automod", "welcome", "logs", "messages"} else all_data
+    message = None
+    error = None
+    if request.method == "POST":
+        if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("csrf_token", "")):
+            return "Invalid security token. Refresh and try again.", 400
+        for key, label, field_type in fields:
+            if field_type == "checkbox":
+                raw = request.form.get(key, "")
+            else:
+                raw = request.form.get(key, "")
+            data[key] = form_value_to_storage(section, key, raw, field_type)
+        if section == "tickets":
+            data.setdefault("enabled", True)
+            data.setdefault("panel_title", "Support Ticket")
+            data.setdefault("panel_description", "Press the button below to create a private support ticket.")
+            data.setdefault("panel_footer", "SupportBot")
+            data.setdefault("panel_color", "5865F2")
+            data.setdefault("button_label", "Create Ticket")
+            data.setdefault("channel_name", "ticket-{username}")
+            data.setdefault("welcome_title", "Support Ticket")
+            data.setdefault("welcome_message", "Hello {user_mention}! Please describe your issue and our team will help you.")
+            data.setdefault("welcome_embed", True)
+        save_server_settings(int(server_id), all_data)
+        message = "Settings saved for this server."
+        data = all_data.setdefault(section, {}) if section in {"tickets", "automod", "welcome", "logs", "messages"} else all_data
+    form_fields = []
+    for key, label, field_type in fields:
+        default = ""
+        if section == "tickets":
+            defaults = {"enabled": True, "channel_name": "ticket-{username}", "panel_title": "Support Ticket", "panel_description": "Press the button below to create a private support ticket.", "panel_footer": "SupportBot", "panel_color": "5865F2", "button_label": "Create Ticket", "welcome_title": "Support Ticket", "welcome_message": "Hello {user_mention}! Please describe your issue and our team will help you.", "welcome_embed": True}
+            default = defaults.get(key, "")
+        elif section == "automod":
+            defaults = {"enabled": False, "block_links": True, "block_invites": True, "block_spam": True, "block_profanity": False, "max_repeated_messages": 5, "spam_window_seconds": 8, "penalty": "delete", "allowed_domains": [], "exempt_role_ids": []}
+            default = defaults.get(key, "")
+        elif section == "welcome":
+            default = {"enabled": False, "message_type": "embed", "message": "Welcome {user_mention} to {server_name}!"}.get(key, "")
+        elif section == "logs":
+            default = {"enabled": False, "message_type": "embed", "message": "{action}: {user_name}"}.get(key, "")
+        elif section == "language":
+            default = "en"
+        value = data.get(key, default)
+        form_fields.append({"key": key, "label": label, "type": field_type, "value": storage_value_to_form(section, key, value, field_type)})
+    return page(section_title, """
+    <div class="card"><a class="button gray" href="/server/{{ server_id }}">← Server Settings</a><h1>{{ title }}</h1>
+    <p>These settings affect only <strong>{{ server_name }}</strong>.</p>
+    {% if message %}<div class="notice">{{ message }}</div>{% endif %}{% if error %}<div class="notice">{{ error }}</div>{% endif %}
+    <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf }}">
+    {% for f in fields %}<label>{{ f.label }}</label>
+      {% if f.type == 'checkbox' %}<input type="checkbox" name="{{ f.key }}" {% if f.value %}checked{% endif %} style="width:auto;display:inline-block;margin:8px 0 18px">
+      {% elif f.type == 'textarea' %}<textarea name="{{ f.key }}" rows="5">{{ f.value }}</textarea>
+      {% elif f.type == 'number' %}<input type="number" name="{{ f.key }}" value="{{ f.value }}" min="1" max="120">
+      {% else %}<input name="{{ f.key }}" value="{{ f.value }}">{% endif %}
+    {% endfor %}<button>Save Settings</button></form></div>
+    {% if section == 'tickets' %}<div class="card"><h2>Publish Ticket Panel</h2><p>Save your ticket settings first. Enter a text channel ID above, then publish the panel there.</p>
+    <form method="post" action="/server/{{ server_id }}/tickets/publish"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="green">Publish / Send Ticket Panel</button></form></div>{% endif %}
+    <div class="card"><h3>Template variables</h3><p class="muted">Tickets: {user_mention}, {user_name}, {server_name}. Welcome: {user_name}, {user_display_name}, {user_mention}, {user_id}, {server_name}, {server_id}, {member_count}. Logs: {action}, {user_name}, {channel_name}, {message_content}, {message_before}, {message_after}.</p></div>
+    """, title=section_title, server_id=server_id, server_name=guild.get("name", "Discord Server"), fields=form_fields, message=message, error=error, csrf=csrf_token(), section=section)
+
+
+@app.route("/server/<server_id>/tickets/publish", methods=["POST"])
+def publish_ticket_panel(server_id):
+    guild_data, error_response = get_authorized_server(server_id)
+    if error_response:
+        return error_response
+    if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("csrf_token", "")):
+        return "Invalid security token. Refresh and try again.", 400
+    data = get_server_settings(int(server_id)).get("tickets", {})
+    channel_id = data.get("panel_channel_id")
+    if not channel_id:
+        return "Save a valid Panel channel ID in Tickets settings first.", 400
+    if not bot or not bot_loop or not bot_loop.is_running() or not bot_running:
+        return "The Discord bot is currently offline.", 503
+    async def send_panel():
+        guild_obj = bot.get_guild(int(server_id))
+        if guild_obj is None:
+            raise RuntimeError("Bot is not installed in this server or has not loaded it yet.")
+        channel = guild_obj.get_channel(int(channel_id))
+        if not isinstance(channel, discord.TextChannel):
+            raise RuntimeError("Panel channel not found. Check the channel ID and bot access.")
+        view = TicketCreateView()
+        label = str(data.get("button_label", "Create Ticket"))[:80]
+        view.children[0].label = label or "Create Ticket"
+        await channel.send(embed=ticket_panel_embed(data), view=view)
+    try:
+        asyncio.run_coroutine_threadsafe(send_panel(), bot_loop).result(timeout=20)
+    except Exception as exc:
+        print("Publish ticket panel failed:", repr(exc))
+        return f"Could not publish ticket panel: {html.escape(str(exc))}", 400
+    return redirect(f"/server/{server_id}/tickets")
+
+
+@app.route("/server/<server_id>/reset", methods=["POST"])
+def reset_server_route(server_id):
+    guild, error_response = get_authorized_server(server_id)
+    if error_response:
+        return error_response
+    if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("csrf_token", "")):
+        return "Invalid security token. Refresh and try again.", 400
+    reset_server_settings(int(server_id))
+    return redirect(f"/server/{server_id}")
 
 @app.route("/bot-settings", methods=["GET", "POST"])
 def bot_settings():
